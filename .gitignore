@@ -1,0 +1,17 @@
+# JavaScript dependencies and generated web assets
+node_modules/
+dist/
+
+# Tauri/Rust build outputs and generated installers
+src-tauri/target/
+src-tauri/gen/
+
+# Local runtime files
+*.log
+outputs/
+work/
+
+# OS and editor files
+.DS_Store
+.idea/
+.vscode/
