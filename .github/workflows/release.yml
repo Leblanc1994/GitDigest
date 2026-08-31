@@ -60,7 +60,7 @@ jobs:
 
       - name: Build installers for download
         if: github.event_name == 'workflow_dispatch'
-        run: npm run tauri:build -- ${{ matrix.args }}
+        run: npx --yes @tauri-apps/cli@2.11.4 build ${{ matrix.args }}
 
       - name: Upload installers
         if: github.event_name == 'workflow_dispatch'
