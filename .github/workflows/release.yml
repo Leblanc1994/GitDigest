@@ -31,18 +31,22 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.0
+
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
+          cache: pnpm
 
       - name: Install JavaScript dependencies
-        run: |
-          npm ci --include=dev --no-audit --no-fund || npm install --include=dev --no-audit --no-fund
+        run: pnpm install --frozen-lockfile
 
       - name: Verify web build
-        run: npm run build
+        run: pnpm run build
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -64,7 +68,7 @@ jobs:
 
       - name: Build installers for download
         if: github.event_name == 'workflow_dispatch'
-        run: npm run tauri:build -- ${{ matrix.args }}
+        run: pnpm run tauri:build -- ${{ matrix.args }}
 
       - name: Upload installers
         if: github.event_name == 'workflow_dispatch'
