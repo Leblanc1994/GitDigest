@@ -17,10 +17,13 @@ jobs:
         include:
           - platform: macos-14
             target: aarch64-apple-darwin
+            bundle_args: --bundles dmg
           - platform: macos-13
             target: x86_64-apple-darwin
+            bundle_args: --bundles dmg
           - platform: windows-latest
             target: x86_64-pc-windows-msvc
+            bundle_args: --bundles nsis
 
     runs-on: ${{ matrix.platform }}
 
@@ -58,13 +61,14 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: GitDigest ${{ github.ref_name }}
-          releaseBody: 自动构建的 GitDigest 桌面安装包。macOS 请选择 `.dmg`，Windows 请选择 `.msi` 或 `.exe`。
+          releaseBody: 自动构建的 GitDigest 桌面安装包。macOS 请选择 `.dmg`，Windows 请选择 `.exe`。
           releaseDraft: true
           prerelease: false
+          args: ${{ matrix.bundle_args }}
 
       - name: Build installers for download
         if: github.event_name == 'workflow_dispatch'
-        run: pnpm run tauri:build
+        run: pnpm exec tauri build ${{ matrix.bundle_args }}
 
       - name: Upload installers
         if: github.event_name == 'workflow_dispatch'

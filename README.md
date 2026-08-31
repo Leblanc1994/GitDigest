@@ -24,7 +24,7 @@ npm run tauri:dev
 npm run tauri:build
 ```
 
-安装包会出现在 `src-tauri/target/release/bundle/` 下。macOS、Windows 需要分别在对应系统上构建；使用桌面版的用户仍需安装 Git。
+安装包会出现在 `src-tauri/target/release/bundle/` 下。macOS 生成 `.dmg`，Windows 生成 `.exe` 安装包；两者需分别在对应系统上构建。使用桌面版的用户仍需安装 Git。
 
 网页模式和桌面模式共用同一套界面代码：网页模式继续请求本地 Node 服务，桌面模式自动切换为 Tauri 原生命令。
 
