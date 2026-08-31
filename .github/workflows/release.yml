@@ -38,7 +38,8 @@ jobs:
           cache: npm
 
       - name: Install JavaScript dependencies
-        run: npm ci --include=dev
+        run: |
+          npm ci --include=dev --no-audit --no-fund || npm install --include=dev --no-audit --no-fund
 
       - name: Verify web build
         run: npm run build
