@@ -34,11 +34,14 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
 
       - name: Install JavaScript dependencies
-        run: npm ci
+        run: npm ci --include=dev
+
+      - name: Verify web build
+        run: npm run build
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -60,7 +63,7 @@ jobs:
 
       - name: Build installers for download
         if: github.event_name == 'workflow_dispatch'
-        run: npx --yes @tauri-apps/cli@2.11.4 build ${{ matrix.args }}
+        run: npm run tauri:build -- ${{ matrix.args }}
 
       - name: Upload installers
         if: github.event_name == 'workflow_dispatch'
