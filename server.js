@@ -9,6 +9,8 @@ const root = resolve(import.meta.dirname);
 const staticRoot = resolve(root, 'dist');
 const port = Number(process.env.PORT || 4173);
 const mimeTypes = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml' };
+const aiModel = process.env.OPENAI_MODEL || 'gpt-5.4';
+const aiTimeoutMs = 45_000;
 
 function log(message) {
   const line = `${new Date().toISOString()} ${message}\n`;
@@ -121,6 +123,88 @@ async function scanProject(path, startDate, endDate, onlyMine) {
   return { name: basename(path), path, branch, authorEmail, commits, changedFiles: changedFiles.size };
 }
 
+function aiSource(activities) {
+  return activities.map((activity) => ({
+    project: activity.name,
+    branch: activity.branch,
+    commits: activity.commits.map((commit) => ({
+      date: commit.date,
+      summary: commit.summary,
+      files: commit.files.slice(0, 30),
+    })),
+  }));
+}
+
+function responseText(response) {
+  if (typeof response.output_text === 'string') return response.output_text;
+  return (response.output || []).flatMap((item) => item.content || [])
+    .filter((item) => item.type === 'output_text')
+    .map((item) => item.text || '')
+    .join('');
+}
+
+function aiEndpoint(baseUrl) {
+  const value = String(baseUrl || '').trim().replace(/\/+$/, '');
+  if (!/^https?:\/\//i.test(value)) throw new Error('Base URL 必须以 http:// 或 https:// 开头。');
+  return value.endsWith('/responses') ? value : `${value}/responses`;
+}
+
+async function enhanceReportWithAi(activities, mode, baseUrl, apiKey) {
+  if (!String(apiKey || '').trim()) throw new Error('请填写 AI API Key。');
+  if (!Array.isArray(activities)) throw new Error('AI 分析数据格式无效。');
+  const schema = {
+    type: 'object', additionalProperties: false,
+    properties: {
+      overview: { type: 'string' },
+      sections: {
+        type: 'array', items: {
+          type: 'object', additionalProperties: false,
+          properties: {
+            project: { type: 'string' },
+            groups: {
+              type: 'array', items: {
+                type: 'object', additionalProperties: false,
+                properties: { scope: { type: 'string' }, actions: { type: 'array', items: { type: 'string' } } },
+                required: ['scope', 'actions'],
+              },
+            },
+          }, required: ['project', 'groups'],
+        },
+      },
+      footer: { type: 'string' },
+    },
+    required: ['overview', 'sections', 'footer'],
+  };
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), aiTimeoutMs);
+  try {
+    const response = await fetch(aiEndpoint(baseUrl), {
+      method: 'POST', signal: controller.signal,
+      headers: { authorization: `Bearer ${apiKey.trim()}`, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: aiModel,
+        input: [
+          {
+            role: 'system',
+            content: '你是严谨的中文工作周报助手。仅依据提供的 Git 提交摘要和文件路径撰写，不要虚构需求、业务结果、测试完成情况、进度、风险或计划。合并语义重复的提交，使用简洁、可汇报的中文。项目没有提交时不要为它生成工作项。footer 表示待跟进或下周计划；如果提交记录没有依据，请写“待根据业务排期和验收反馈确认后续工作。”',
+          },
+          { role: 'user', content: `请整理一份${mode === 'weekly' ? '周报' : '日报'}。Git 依据如下：\n${JSON.stringify(aiSource(activities))}` },
+        ],
+        text: { format: { type: 'json_schema', name: 'git_report', strict: true, schema } },
+      }),
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(result?.error?.message || `AI 服务请求失败（${response.status}）`);
+    const text = responseText(result);
+    if (!text) throw new Error('AI 未返回可用的报告内容。');
+    return JSON.parse(text);
+  } catch (error) {
+    if (error.name === 'AbortError') throw new Error('AI 整理超时，请稍后重试。');
+    if (error instanceof SyntaxError) throw new Error('AI 返回格式无效，请重试。');
+    throw error;
+  } finally { clearTimeout(timeout); }
+}
+
 async function handleApi(req, res) {
   try {
     if (req.url === '/api/select-projects' && req.method === 'POST') {
@@ -137,6 +221,14 @@ async function handleApi(req, res) {
       const activities = await Promise.all(paths.map(path => scanProject(path, startDate, endDate, onlyMine)));
       log(`Git 读取完成：${activities.map(activity => `${activity.name} ${activity.commits.length} 条提交`).join(' | ')}`);
       return send(res, 200, { activities });
+    }
+    if (req.url === '/api/ai-report' && req.method === 'POST') {
+      const { activities, mode, baseUrl, apiKey } = await readJson(req);
+      if (!['daily', 'weekly'].includes(mode)) throw new Error('报告类型无效。');
+      log(`开始 AI 整理：${mode}，${activities?.length || 0} 个项目`);
+      const report = await enhanceReportWithAi(activities, mode, baseUrl, apiKey);
+      log('AI 整理完成');
+      return send(res, 200, { report });
     }
     if (req.url === '/api/client-log' && req.method === 'POST') {
       const { message } = await readJson(req);

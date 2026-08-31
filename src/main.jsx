@@ -3,12 +3,15 @@ import { createRoot } from 'react-dom/client';
 import { invoke } from '@tauri-apps/api/core';
 import { open as openDirectoryDialog } from '@tauri-apps/plugin-dialog';
 import {
-  CalendarDays, Check, ChevronDown, ChevronLeft, ChevronRight, Clipboard, Code2, Download, FileText,
+  CalendarDays, ChevronDown, ChevronLeft, ChevronRight, Clipboard, Code2, Download, FileText,
   FolderGit2, GitCommitHorizontal, Info, LoaderCircle, Plus, RefreshCw,
-  ShieldCheck, Sparkles, Trash2, Users,
+  ShieldCheck, Sparkles, Trash2, Users, WandSparkles,
 } from 'lucide-react';
 import './styles.css';
 import './batch.css';
+import './ai.css';
+import './layout.css';
+import './refinement.css';
 
 const today = new Date().toISOString().slice(0, 10);
 const scopeNames = { finance: '财务', operation: '运营', sales: '销售', purchase: '采购', auth: '权限', user: '用户', admin: '管理后台' };
@@ -36,6 +39,16 @@ async function readGitActivity(payload) {
   return result.activities;
 }
 
+async function enhanceReportWithAi(payload) {
+  if (isDesktopRuntime()) return invoke('enhance_report_with_ai', payload);
+  const response = await fetch('/api/ai-report', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload),
+  });
+  const result = await response.json();
+  if (!response.ok) throw new Error(result.error);
+  return result.report;
+}
+
 function dateRange(date, mode) {
   if (mode === 'daily') return { startDate: date, endDate: date };
   const current = new Date(`${date}T12:00:00`);
@@ -51,7 +64,7 @@ function labelDate(date, mode) {
     const { startDate, endDate } = dateRange(date, mode);
     return `${startDate.slice(5).replace('-', '.')} - ${endDate.slice(5).replace('-', '.')}`;
   }
-  return current.toLocaleDateString('zh-CN', { month: 'long', day: 'numeric', weekday: 'long' });
+  return current.toLocaleDateString('zh-CN', { year: 'numeric', month: 'long', day: 'numeric', weekday: 'long' });
 }
 
 function dateFromIso(value) {
@@ -100,15 +113,31 @@ function escapeHtml(value) {
   return String(value).replace(/[&<>'"]/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' })[char]);
 }
 
-function makeReport(activities, mode) {
+function validAiGroups(groups) {
+  if (!Array.isArray(groups)) return [];
+  return groups.flatMap((group) => {
+    const scope = String(group?.scope || '').trim();
+    const actions = Array.isArray(group?.actions) ? group.actions.map((action) => String(action).trim()).filter(Boolean) : [];
+    return scope && actions.length ? [{ scope, actions }] : [];
+  });
+}
+
+function makeReport(activities, mode, aiContent = null) {
   const commits = activities.reduce((total, activity) => total + activity.commits.length, 0);
   const files = activities.reduce((total, activity) => total + activity.changedFiles, 0);
   const modules = [...new Set(activities.flatMap((activity) => groupedCommits(activity).map((group) => group.scope)))];
-  const overview = `本${mode === 'daily' ? '日' : '周'}完成 ${commits} 项功能迭代，覆盖${modules.length ? ` ${modules.join('、')} 等` : ''}业务模块，涉及 ${files} 个文件变更。`;
-  const sections = activities.map((activity) => ({ project: activity.name, groups: groupedCommits(activity) }));
-  const footer = mode === 'daily'
+  const defaultOverview = `本${mode === 'daily' ? '日' : '周'}完成 ${commits} 项功能迭代，覆盖${modules.length ? ` ${modules.join('、')} 等` : ''}业务模块，涉及 ${files} 个文件变更。`;
+  const defaultFooter = mode === 'daily'
     ? '结合测试与业务验收反馈，确认上述功能的边界场景和后续优化项。'
     : '推进已完成需求的联调、测试与验收，跟进业务反馈并处理遗留问题。';
+  const aiSections = new Map((Array.isArray(aiContent?.sections) ? aiContent.sections : [])
+    .map((section) => [String(section?.project || '').trim(), validAiGroups(section?.groups)]));
+  const sections = activities.map((activity) => ({
+    project: activity.name,
+    groups: aiSections.get(activity.name)?.length ? aiSections.get(activity.name) : groupedCommits(activity),
+  }));
+  const overview = String(aiContent?.overview || '').trim() || defaultOverview;
+  const footer = String(aiContent?.footer || '').trim() || defaultFooter;
   const html = [
     `<section><h2>工作概览</h2><p>${escapeHtml(overview)}</p></section>`,
     ...sections.map((section) => `<section><h2>${escapeHtml(section.project)} · ${mode === 'daily' ? '今日完成' : '本周完成'}</h2><ul>${section.groups.length ? section.groups.map((group) => `<li><strong>${escapeHtml(group.scope)}</strong><span>${group.actions.map(escapeHtml).join('；')}。</span></li>`).join('') : '<li>该时间范围内没有新的 Git 提交。</li>'}</ul></section>`),
@@ -133,6 +162,10 @@ function App() {
   const [weekCursor, setWeekCursor] = useState(dateFromIso(today));
   const [pendingWeek, setPendingWeek] = useState(today);
   const [onlyMine, setOnlyMine] = useState(true);
+  const [aiEnabled, setAiEnabled] = useState(true);
+  const [aiConfigOpen, setAiConfigOpen] = useState(false);
+  const [aiBaseUrl, setAiBaseUrl] = useState('https://api.openai.com/v1');
+  const [aiApiKey, setAiApiKey] = useState('');
   const [reports, setReports] = useState([]);
   const [activeReportDate, setActiveReportDate] = useState(today);
   const [loading, setLoading] = useState(false);
@@ -194,19 +227,34 @@ function App() {
     if (!projects.length) { flash('请先添加至少一个 Git 项目'); return; }
     const reportDates = mode === 'daily' ? dailyDates : [date];
     if (!reportDates.length) { flash('请至少添加一个日报日期'); return; }
+    // AI is an optional enhancement. A local Git-based draft is always available.
+    const useAi = aiEnabled && Boolean(aiBaseUrl.trim() && aiApiKey.trim());
     setLoading(true);
     try {
       const bundles = await Promise.all(reportDates.map(async (reportDate) => {
         try {
           const activities = await readGitActivity({ paths: projects.map((project) => project.path), ...dateRange(reportDate, mode), onlyMine });
-          return { date: reportDate, activities, report: makeReport(activities, mode) };
+          let report = makeReport(activities, mode);
+          let aiError = '';
+          if (useAi && activities.some((activity) => activity.commits.length)) {
+            try {
+              const aiContent = await enhanceReportWithAi({ activities, mode, baseUrl: aiBaseUrl, apiKey: aiApiKey });
+              report = makeReport(activities, mode, aiContent);
+            } catch (error) { aiError = error.message || String(error); }
+          }
+          return { date: reportDate, activities, report, aiError };
         } catch (error) {
           throw new Error(`${reportDate}：${error.message || String(error)}`);
         }
       }));
       setReports(bundles);
       setActiveReportDate(bundles[0].date);
-      flash(mode === 'daily' && bundles.length > 1 ? `已生成 ${bundles.length} 份日报` : '报告已更新');
+      const aiErrors = bundles.filter((bundle) => bundle.aiError);
+      if (aiErrors.length) flash(`已生成 Git 初稿；AI 未完成：${aiErrors[0].aiError}`);
+      else if (mode === 'daily' && bundles.length > 1) flash(`已生成 ${bundles.length} 份日报`);
+      else if (useAi) flash('AI 报告已更新');
+      else if (aiEnabled) flash('已生成 Git 初稿；配置 AI 后可自动润色');
+      else flash('报告已更新');
     } catch (error) { flash(`读取 Git 失败：${error.message}`); }
     finally { setLoading(false); }
   }
@@ -238,15 +286,14 @@ function App() {
 
     <div className="workspace">
       <aside className="sidebar">
-        <div className="panel-heading"><span>项目</span><button className="plain-add" onClick={addProjects}><Plus size={15} /> 添加</button></div>
-        <p className="panel-note">选择要汇总的本地 Git 项目。</p>
         <div className="project-list">
-          {projects.length === 0 && <div className="empty-projects"><FolderGit2 size={18} /><span>还没有项目</span><button onClick={addProjects}>选择项目目录</button></div>}
+          {projects.length === 0 && <div className="empty-projects"><span className="empty-project-icon"><FolderGit2 size={18} /></span><strong>还没有项目</strong><span className="empty-project-copy">添加本地 Git 项目后开始生成日报。</span><button className="empty-project-action" onClick={addProjects}><Plus size={14} />添加项目</button></div>}
           {projects.map((project) => <div className="project-row" key={project.path}>
             <FolderGit2 size={16} /><div className="project-copy"><strong>{project.name}</strong><span>{project.path}</span></div>
             <IconButton label={`移除 ${project.name}`} onClick={() => removeProject(project.path)}><Trash2 size={14} /></IconButton>
           </div>)}
         </div>
+        {projects.length > 0 && <button className="project-list-add" onClick={addProjects}><Plus size={14} />添加项目</button>}
         <div className="sidebar-bottom"><Info size={14} /><span>支持选择多个仓库一起生成。</span></div>
       </aside>
 
@@ -275,9 +322,20 @@ function App() {
               <div className="calendar-footer"><span>{labelDate(pendingWeek, 'weekly')}</span><div><button onClick={() => setWeekOpen(false)}>取消</button><button className="calendar-confirm" onClick={confirmWeek}>确认本周</button></div></div>
             </div>}
           </div>}
-          <label className="checkbox-control"><input type="checkbox" checked={onlyMine} onChange={(event) => setOnlyMine(event.target.checked)} /><span><Check size={12} /></span>只统计我的提交</label>
-          <button className="generate-button" onClick={generate} disabled={loading}>{loading ? <LoaderCircle size={16} className="spin" /> : <Sparkles size={16} />}{loading ? '读取 Git 中' : '生成报告'}</button>
+          <label className="checkbox-control"><input type="checkbox" checked={onlyMine} onChange={(event) => setOnlyMine(event.target.checked)} /><span aria-hidden="true" />只统计我的提交</label>
+          <label className="checkbox-control ai-control"><input type="checkbox" checked={aiEnabled} onChange={(event) => setAiEnabled(event.target.checked)} /><span aria-hidden="true" /><WandSparkles size={13} />AI 润色（可选）</label>
+          <button className="ai-settings-button" type="button" onClick={() => setAiConfigOpen((open) => !open)} aria-expanded={aiConfigOpen}>AI 设置</button>
+          {aiEnabled && !aiConfigOpen && <span className={`ai-config-state ${aiApiKey.trim() ? 'ready' : ''}`}>{aiApiKey.trim() ? 'AI 已配置' : '未配置，使用本地汇总'}</span>}
+          <button className="generate-button" onClick={generate} disabled={!projects.length || loading} title={!projects.length ? '请先添加项目' : undefined}>{loading ? <LoaderCircle size={16} className="spin" /> : <Sparkles size={16} />}{loading ? '读取并整理中' : !projects.length ? '添加项目后生成' : '生成报告'}</button>
         </div>
+        {aiEnabled && aiConfigOpen && <div className="ai-settings" role="group" aria-label="AI 设置">
+          <div className="ai-settings-heading"><span className="ai-settings-mark">AI</span><div><strong>AI 润色（可选）</strong><span>未配置时仍会生成本地 Git 初稿</span></div></div>
+          <div className="ai-settings-fields">
+            <label><span>Base URL</span><input value={aiBaseUrl} onChange={(event) => setAiBaseUrl(event.target.value)} placeholder="https://api.openai.com/v1" spellCheck="false" /></label>
+            <label><span>API Key</span><input type="password" value={aiApiKey} onChange={(event) => setAiApiKey(event.target.value)} placeholder="输入 API Key" autoComplete="off" spellCheck="false" /></label>
+          </div>
+          <div className="ai-security-note"><ShieldCheck size={14} /><span>仅用于当前会话<br />不会保存到本机</span></div>
+        </div>}
         </div>
 
         <section className="document-sheet">
@@ -286,14 +344,14 @@ function App() {
             <div className="export-actions"><IconButton label="复制报告" onClick={copyReport} disabled={!report}><Clipboard size={16} /></IconButton><button className="secondary-button" onClick={exportReport} disabled={!report}><Download size={15} />导出 Markdown</button></div>
           </div>
           {mode === 'daily' && reports.length > 1 && <div className="report-tabs" role="tablist">{reports.map((bundle) => <button role="tab" aria-selected={activeReportDate === bundle.date} className={activeReportDate === bundle.date ? 'active' : ''} key={bundle.date} onClick={() => setActiveReportDate(bundle.date)}>{labelDate(bundle.date, 'daily')}</button>)}</div>}
-          {report ? <article className="report-content" ref={reportRef} contentEditable suppressContentEditableWarning dangerouslySetInnerHTML={{ __html: report.html }} onInput={(event) => setReports((current) => current.map((bundle) => bundle.date === activeReportDate ? { ...bundle, report: { ...bundle.report, html: event.currentTarget.innerHTML } } : bundle))} /> : <div className="report-empty"><FileText size={30} /><h2>准备一份新的工作报告</h2><p>选择项目和日期后，报告会根据你的 Git 提交生成。</p><button onClick={generate}><Sparkles size={15} />生成报告</button></div>}
+          {report ? <article className="report-content" ref={reportRef} contentEditable suppressContentEditableWarning dangerouslySetInnerHTML={{ __html: report.html }} onInput={(event) => setReports((current) => current.map((bundle) => bundle.date === activeReportDate ? { ...bundle, report: { ...bundle.report, html: event.currentTarget.innerHTML } } : bundle))} /> : <div className="report-empty"><span className="report-empty-icon"><FileText size={30} /></span><h2>{projects.length ? '准备一份新的工作报告' : '先添加一个项目'}</h2><p>{projects.length ? '确认日期和提交范围后，生成一份可编辑的日报。' : '日报引擎只读取本机 Git 数据，不会上传你的代码。'}</p><div className="empty-steps"><span><b>1</b> 添加项目</span><span><b>2</b> 选择日期</span><span><b>3</b> 生成报告</span></div><button onClick={projects.length ? generate : addProjects}><Sparkles size={15} />{projects.length ? '生成报告' : '添加项目'}</button></div>}
           <footer className="document-footer"><span><ShieldCheck size={13} /> 仅基于本地 Git 数据</span>{report && <span>{report.commits} 条提交 · {report.files} 个文件变更</span>}</footer>
         </section>
       </main>
 
       <aside className="source-panel">
         <div className="panel-heading"><span>提交依据</span><span className="source-count">{activities.reduce((total, activity) => total + activity.commits.length, 0)}</span></div>
-        {!report && <div className="source-empty"><Code2 size={20} /><p>生成报告后，这里会保留对应的 Git 提交依据。</p></div>}
+        {!report && <div className="source-empty"><Code2 size={20} /><p>{projects.length ? '生成报告后，这里会保留对应的 Git 提交依据。' : '选择项目后，这里会显示 Git 提交依据。'}</p></div>}
         {activities.map((activity) => <div className="source-project" key={activity.path}><div className="source-project-name"><FolderGit2 size={14} />{activity.name}<span>{activity.branch}</span></div>{activity.commits.map((commit) => <details className="commit-row" key={commit.hash}><summary><GitCommitHorizontal size={14} /><span>{commit.summary}</span><ChevronDown size={14} /></summary><div className="commit-detail"><span>{commit.author} · {commit.date}</span><span>{commit.files.length} 个文件变更</span></div></details>)}</div>)}
         {report && <div className="source-note"><Users size={14} />{onlyMine ? '已按当前 Git 身份过滤' : '已包含所有作者的提交'}</div>}
       </aside>

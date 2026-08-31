@@ -1,0 +1,9 @@
+html, body, #root { height: 100%; overflow: hidden; }
+.app-shell { height: 100vh; min-height: 0; overflow: hidden; }
+.workspace { height: calc(100vh - 58px); min-height: 0; }
+.sidebar, .source-panel { min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
+.report-workspace { display: flex; flex-direction: column; height: 100%; min-height: 0; overflow: hidden; }
+.control-area { flex: 0 0 auto; }
+.document-sheet { flex: 1 1 auto; min-height: 0; }
+.report-content { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
+.report-empty { min-height: 0; }
