@@ -1,4 +1,5 @@
 import { createServer } from 'node:http';
+import { createCipheriv } from 'node:crypto';
 import { appendFile, readFile, stat } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -100,7 +101,41 @@ async function gitUserEmail(path) {
   }
 }
 
-async function scanProject(path, startDate, endDate, onlyMine) {
+async function workingTreeChange(path) {
+  const output = await git(path, ['status', '--porcelain=v1', '-z', '--untracked-files=normal']);
+  const untrackedPaths = (await git(path, ['ls-files', '--others', '--exclude-standard']))
+    .split('\n').map((file) => file.trim()).filter(Boolean);
+  const entries = output.split('\0');
+  const files = [];
+  let staged = 0;
+  let unstaged = 0;
+  let untracked = 0;
+  for (let index = 0; index < entries.length; index += 1) {
+    const entry = entries[index];
+    if (!entry) continue;
+    const status = entry.slice(0, 2);
+    const file = entry.slice(3).trim();
+    if (status === '??') { untracked += 1; continue; }
+    if (file) files.push(file);
+    if (status[0] !== ' ') staged += 1;
+    if (status[1] !== ' ') unstaged += 1;
+    if ((status[0] === 'R' || status[0] === 'C') && entries[index + 1]) index += 1;
+  }
+  files.push(...untrackedPaths);
+  if (!files.length) return null;
+  const parts = [];
+  if (staged) parts.push(`已暂存 ${staged} 个文件`);
+  if (unstaged) parts.push(`未暂存 ${unstaged} 个文件`);
+  if (untrackedPaths.length) untracked = untrackedPaths.length;
+  if (untracked) parts.push(`新增未跟踪 ${untracked} 个文件`);
+  return {
+    hash: 'working-tree', author: '本地工作区', authorEmail: '', date: '',
+    summary: `未提交本地变更（${parts.join('，')}）`, files: [...new Set(files)], source: 'working-tree',
+    stagedFiles: staged, unstagedFiles: unstaged, untrackedFiles: untracked,
+  };
+}
+
+async function scanProject(path, startDate, endDate, onlyMine, includeUncommitted = false) {
   const info = await stat(path).catch(() => null);
   if (!info?.isDirectory()) throw new Error(`目录不存在：${path}`);
   await git(path, ['rev-parse', '--is-inside-work-tree']);
@@ -118,8 +153,12 @@ async function scanProject(path, startDate, endDate, onlyMine) {
     if (onlyMine && fields[3].trim().toLowerCase() !== authorEmail) return [];
     const files = fields.slice(5).flatMap(field => field.split('\n')).map(file => file.trim()).filter(Boolean);
     files.forEach(file => changedFiles.add(file));
-    return [{ hash: fields[0].trim(), author: fields[1].trim(), authorEmail: fields[3].trim(), date: fields[2].trim(), summary: fields[4].trim(), files }];
+    return [{ hash: fields[0].trim(), author: fields[1].trim(), authorEmail: fields[3].trim(), date: fields[2].trim(), summary: fields[4].trim(), files, source: 'commit' }];
   });
+  if (includeUncommitted) {
+    const change = await workingTreeChange(path);
+    if (change) { change.files.forEach(file => changedFiles.add(file)); commits.push(change); }
+  }
   return { name: basename(path), path, branch, authorEmail, commits, changedFiles: changedFiles.size };
 }
 
@@ -127,7 +166,8 @@ function aiSource(activities) {
   return activities.map((activity) => ({
     project: activity.name,
     branch: activity.branch,
-    commits: activity.commits.map((commit) => ({
+    changes: activity.commits.map((commit) => ({
+      source: commit.source || 'commit',
       date: commit.date,
       summary: commit.summary,
       files: commit.files.slice(0, 30),
@@ -186,7 +226,7 @@ async function enhanceReportWithAi(activities, mode, baseUrl, apiKey) {
         input: [
           {
             role: 'system',
-            content: '你是严谨的中文工作周报助手。仅依据提供的 Git 提交摘要和文件路径撰写，不要虚构需求、业务结果、测试完成情况、进度、风险或计划。合并语义重复的提交，使用简洁、可汇报的中文。项目没有提交时不要为它生成工作项。footer 表示待跟进或下周计划；如果提交记录没有依据，请写“待根据业务排期和验收反馈确认后续工作。”',
+            content: '你是严谨的中文工作周报助手。仅依据提供的 Git 变更摘要和文件路径撰写，不要虚构需求、业务结果、测试完成情况、进度、风险或计划。source 为 working-tree 的内容是尚未提交的本地改动，必须明确表述为“已修改/待提交”，不得写成“已完成”或“已上线”。合并语义重复的变更，使用简洁、可汇报的中文。项目没有变更时不要为它生成工作项。footer 表示待跟进或下周计划；如果变更记录没有依据，请写“待根据业务排期和验收反馈确认后续工作。”',
           },
           { role: 'user', content: `请整理一份${mode === 'weekly' ? '周报' : '日报'}。Git 依据如下：\n${JSON.stringify(aiSource(activities))}` },
         ],
@@ -205,6 +245,95 @@ async function enhanceReportWithAi(activities, mode, baseUrl, apiKey) {
   } finally { clearTimeout(timeout); }
 }
 
+function pmsBaseUrl(value) {
+  let url;
+  try { url = new URL(String(value || '').trim()); } catch { throw new Error('工时系统地址无效。'); }
+  if (!['http:', 'https:'].includes(url.protocol)) throw new Error('工时系统地址必须以 http:// 或 https:// 开头。');
+  return url.origin;
+}
+
+async function pmsApi(baseUrl, path, { method = 'GET', token, tenantId, body } = {}) {
+  const headers = { 'tenant-id': String(tenantId), 'content-type': 'application/json' };
+  if (token) headers.authorization = `Bearer ${token}`;
+  let response;
+  try {
+    response = await fetch(`${baseUrl}/admin-api${path}`, { method, headers, body: body ? JSON.stringify(body) : undefined, signal: AbortSignal.timeout(20_000) });
+  } catch { throw new Error('无法连接工时系统，请确认地址和网络。'); }
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok || result.code !== 0) throw new Error(result.msg || `工时系统请求失败（${response.status}）`);
+  return result.data;
+}
+
+function encryptPmsPassword(password, key) {
+  const secret = String(key || '');
+  if (Buffer.byteLength(secret, 'utf8') !== 32) throw new Error('工时系统加密配置无效。');
+  const cipher = createCipheriv('aes-256-cbc', Buffer.from(secret, 'utf8'), Buffer.from(secret.slice(0, 16), 'utf8'));
+  return Buffer.concat([cipher.update(String(password), 'utf8'), cipher.final()]).toString('base64');
+}
+
+async function pmsLogin(config) {
+  const baseUrl = pmsBaseUrl(config.baseUrl);
+  const tenantName = String(config.tenantName || '000000').trim();
+  const username = String(config.username || '').trim();
+  const password = String(config.password || '');
+  if (!tenantName || !username || !password) throw new Error('请填写租户、账号和密码。');
+  const tenantId = await pmsApi(baseUrl, `/system/tenant/get-id-by-name?name=${encodeURIComponent(tenantName)}`, { tenantId: '0' });
+  if (!tenantId) throw new Error('未找到对应的工时系统租户。');
+  const encryptionKey = await pmsApi(baseUrl, '/infra/config/get-value-by-key?key=sys.private.key', { tenantId });
+  const session = await pmsApi(baseUrl, '/system/auth/login', {
+    method: 'POST', tenantId,
+    body: { tenantName, username, password: encryptPmsPassword(password, encryptionKey), captchaVerification: '', rememberMe: false },
+  });
+  if (!session?.accessToken) throw new Error('工时系统登录未返回访问凭证。');
+  return { baseUrl, tenantId, token: session.accessToken };
+}
+
+function mondayOf(date) {
+  const value = new Date(`${date}T12:00:00`);
+  const weekday = value.getDay() || 7;
+  value.setDate(value.getDate() - weekday + 1);
+  return value.toISOString().slice(0, 10);
+}
+
+async function pmsProjects(config) {
+  const session = await pmsLogin(config);
+  const page = await pmsApi(session.baseUrl, '/pm/timesheet/project-page?pageNo=1&pageSize=500', session);
+  return (page?.list || []).map(({ id, code, name, financeOrgName, managerName, status, statusLabel }) => ({ id, code, name, financeOrgName, managerName, status, statusLabel }));
+}
+
+async function pushPmsTimesheets(config, entries) {
+  if (!Array.isArray(entries) || !entries.length) throw new Error('请至少选择一条待推送工时。');
+  if (entries.length > 100) throw new Error('单次最多推送 100 条工时。');
+  const session = await pmsLogin(config);
+  const results = [];
+  for (const entry of entries) {
+    const projectId = Number(entry.projectId);
+    const date = String(entry.date || '');
+    const manDays = Number(entry.manDays);
+    const remark = String(entry.remark || '').trim();
+    if (!Number.isInteger(projectId) || projectId <= 0 || !/^\d{4}-\d{2}-\d{2}$/.test(date) || !Number.isFinite(manDays) || manDays <= 0 || manDays > 31 || !remark) {
+      results.push({ clientId: entry.clientId, status: 'failed', message: '项目、日期、工时和工作内容均为必填。' });
+      continue;
+    }
+    try {
+      const periodKey = mondayOf(date);
+      const period = await pmsApi(session.baseUrl, `/pm/timesheet/get-period?projectId=${projectId}&viewMode=week&periodKey=${periodKey}`, session);
+      if (Number(period?.entries?.[date] || 0) > 0) {
+        results.push({ clientId: entry.clientId, status: 'skipped', message: '该项目当天已有已填报工时，未覆盖。' });
+        continue;
+      }
+      const entriesByDate = { ...(period?.entries || {}), [date]: Number(manDays.toFixed(2)) };
+      const contentsByDate = { ...(period?.workContents || {}), [date]: remark };
+      await pmsApi(session.baseUrl, '/pm/timesheet/period', {
+        method: 'POST', ...session,
+        body: { projectId, viewMode: 'week', periodKey, entries: entriesByDate, workContents: contentsByDate },
+      });
+      results.push({ clientId: entry.clientId, status: 'submitted', message: '已推送。' });
+    } catch (error) { results.push({ clientId: entry.clientId, status: 'failed', message: error.message || '推送失败。' }); }
+  }
+  return results;
+}
+
 async function handleApi(req, res) {
   try {
     if (req.url === '/api/select-projects' && req.method === 'POST') {
@@ -214,11 +343,11 @@ async function handleApi(req, res) {
       return send(res, 200, { paths });
     }
     if (req.url === '/api/git-activity' && req.method === 'POST') {
-      const { paths, startDate, endDate, onlyMine = true } = await readJson(req);
+      const { paths, startDate, endDate, onlyMine = true, includeUncommitted = false } = await readJson(req);
       if (!Array.isArray(paths) || !paths.length) throw new Error('请至少选择一个 Git 项目。');
       if (!/^\d{4}-\d{2}-\d{2}$/.test(startDate || '') || !/^\d{4}-\d{2}-\d{2}$/.test(endDate || '')) throw new Error('日期格式无效。');
       log(`开始读取 Git：${paths.join(' | ')}，${startDate} 至 ${endDate}，${onlyMine ? '仅当前作者' : '所有作者'}`);
-      const activities = await Promise.all(paths.map(path => scanProject(path, startDate, endDate, onlyMine)));
+      const activities = await Promise.all(paths.map(path => scanProject(path, startDate, endDate, onlyMine, includeUncommitted)));
       log(`Git 读取完成：${activities.map(activity => `${activity.name} ${activity.commits.length} 条提交`).join(' | ')}`);
       return send(res, 200, { activities });
     }
@@ -229,6 +358,16 @@ async function handleApi(req, res) {
       const report = await enhanceReportWithAi(activities, mode, baseUrl, apiKey);
       log('AI 整理完成');
       return send(res, 200, { report });
+    }
+    if (req.url === '/api/pms/projects' && req.method === 'POST') {
+      const { config } = await readJson(req);
+      const projects = await pmsProjects(config || {});
+      return send(res, 200, { projects });
+    }
+    if (req.url === '/api/pms/push' && req.method === 'POST') {
+      const { config, entries } = await readJson(req);
+      const results = await pushPmsTimesheets(config || {}, entries);
+      return send(res, 200, { results });
     }
     if (req.url === '/api/client-log' && req.method === 'POST') {
       const { message } = await readJson(req);
