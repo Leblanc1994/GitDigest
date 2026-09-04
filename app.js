@@ -70,20 +70,19 @@ function groupProjectCommits(activity) {
 }
 function makeReportHtml(activities, isWeekly) {
   const totalCommits = activities.reduce((total, activity) => total + activity.commits.length, 0);
-  const totalFiles = activities.reduce((total, activity) => total + activity.changedFiles, 0);
   const modules = [...new Set(activities.flatMap(activity => groupProjectCommits(activity).map(group => group.scope)))];
   const period = isWeekly ? '本周' : '今日';
-  const overview = `<section><h3>工作概览</h3><ul><li>${period}完成 ${totalCommits} 项功能迭代，覆盖${modules.length ? ` ${modules.join('、')} 等` : ''}业务模块，涉及 ${totalFiles} 个文件变更。</li></ul></section>`;
+  const overview = `<section><h3>工作概览</h3><ul><li>${period}围绕${modules.length ? ` ${modules.join('、')} 等` : '相关业务'}模块完成 ${totalCommits} 项工作。</li></ul></section>`;
   const details = activities.map(activity => {
     const groups = groupProjectCommits(activity);
     const lines = groups.length
       ? groups.map(group => `<li><strong>${escapeHtml(group.scope)}</strong>：${group.actions.map(escapeHtml).join('；')}。</li>`).join('')
-      : '<li>该时间范围内没有新的 Git 提交。</li>';
-    return `<section><h3>${escapeHtml(activity.name)} · ${isWeekly ? '本周完成' : '今日完成'}</h3><ul>${lines}</ul></section>`;
+      : '<li>该时间范围内暂无可识别的工作内容。</li>';
+    return `<section><h3>${escapeHtml(activity.name)} · ${isWeekly ? '本周工作' : '今日工作'}</h3><ul>${lines}</ul></section>`;
   }).join('');
   const followUp = isWeekly
     ? '<section><h3>下周计划</h3><ul><li>推进已完成需求的联调、测试与验收，跟进业务反馈并处理遗留问题。</li></ul></section>'
-    : '<section><h3>待跟进</h3><ul><li>结合测试与业务验收反馈，确认上述功能的边界场景和后续优化项。</li></ul></section>';
+    : '<section><h3>后续安排</h3><ul><li>结合测试与业务验收反馈，确认上述功能的边界场景和后续优化项。</li></ul></section>';
   return overview + details + followUp;
 }
 async function generate() {
@@ -108,14 +107,13 @@ async function generate() {
   }
   try {
     const commits = activities.reduce((total, activity) => total + activity.commits.length, 0);
-    const files = activities.reduce((total, activity) => total + activity.changedFiles, 0);
     const html = makeReportHtml(activities, mode === 'weekly');
     const body = $('#report-body');
     body.className = 'report-body'; body.contentEditable = 'true'; body.innerHTML = html;
-    $('#report-kicker').textContent = mode === 'daily' ? 'DAILY DIGEST / GIT ACTIVITY' : 'WEEKLY DIGEST / GIT ACTIVITY';
+    $('#report-kicker').textContent = mode === 'daily' ? 'DAILY DELIVERY REPORT' : 'WEEKLY DELIVERY REPORT';
     const dateText = mode === 'daily' ? `${d.getMonth() + 1} 月 ${d.getDate()} 日` : '本周';
     $('#report-title').textContent = `${dateText}工作${mode === 'daily' ? '日报' : '周报'}`;
-    $('#report-meta').innerHTML = `<span>${date.value}</span><span>${activities.length} 个项目</span><span>${commits} 条提交</span><span>${files} 个文件变更</span><span>${$('#only-mine').checked ? '仅我的提交' : '所有作者'}</span>`;
+    $('#report-meta').innerHTML = `<span>${date.value}</span><span>${activities.length} 个项目</span>`;
     $('#copy-report').disabled = false; $('#export-report').disabled = false;
     $('#word-count').textContent = `${body.innerText.replace(/\s/g, '').length} 字 · 可直接编辑`;
     body.oninput = () => $('#word-count').textContent = `${body.innerText.replace(/\s/g, '').length} 字 · 已编辑`;

@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { invoke } from '@tauri-apps/api/core';
 import { open as openDirectoryDialog } from '@tauri-apps/plugin-dialog';
@@ -22,6 +22,39 @@ function localToday() {
 const today = localToday();
 const scopeNames = { finance: '财务', operation: '运营', sales: '销售', purchase: '采购', auth: '权限', user: '用户', admin: '管理后台' };
 const isDesktopRuntime = () => Boolean(window.__TAURI_INTERNALS__);
+const workspaceCacheKey = 'daily-engine:workspace:v1';
+const defaultPmsConfig = { baseUrl: 'http://192.168.24.48:8081', tenantName: '000000', username: '', password: '' };
+
+function readWorkspaceCache() {
+  try {
+    const value = JSON.parse(window.localStorage.getItem(workspaceCacheKey) || '{}');
+    if (!value || typeof value !== 'object') return {};
+    return {
+      projects: Array.isArray(value.projects) ? value.projects.filter((project) => project && typeof project.name === 'string' && typeof project.path === 'string') : [],
+      mode: value.mode === 'weekly' ? 'weekly' : 'daily',
+      date: typeof value.date === 'string' ? value.date : today,
+      dailyDates: Array.isArray(value.dailyDates) ? value.dailyDates.filter((item) => typeof item === 'string') : [today],
+      onlyMine: typeof value.onlyMine === 'boolean' ? value.onlyMine : true,
+      aiEnabled: typeof value.aiEnabled === 'boolean' ? value.aiEnabled : true,
+      aiBaseUrl: typeof value.aiBaseUrl === 'string' ? value.aiBaseUrl : 'https://api.openai.com/v1',
+      pmsConfig: {
+        baseUrl: typeof value.pmsConfig?.baseUrl === 'string' ? value.pmsConfig.baseUrl : defaultPmsConfig.baseUrl,
+        tenantName: typeof value.pmsConfig?.tenantName === 'string' ? value.pmsConfig.tenantName : defaultPmsConfig.tenantName,
+        username: typeof value.pmsConfig?.username === 'string' ? value.pmsConfig.username : '',
+      },
+      reports: Array.isArray(value.reports) ? value.reports.filter((bundle) => bundle && typeof bundle.date === 'string' && bundle.report && typeof bundle.report.html === 'string').slice(-10) : [],
+      activeReportDate: typeof value.activeReportDate === 'string' ? value.activeReportDate : today,
+    };
+  } catch {
+    return {};
+  }
+}
+
+function errorMessage(error, fallback = '操作失败。') {
+  if (typeof error === 'string' && error.trim()) return error;
+  if (error && typeof error === 'object' && typeof error.message === 'string' && error.message.trim()) return error.message;
+  return fallback;
+}
 
 async function selectProjectPaths() {
   if (isDesktopRuntime()) {
@@ -59,7 +92,10 @@ async function pmsRequest(path, payload) {
   if (isDesktopRuntime()) {
     const config = await prepareDesktopPmsConfig(payload.config);
     if (path === '/api/pms/projects') return invoke('pms_projects', { config });
-    if (path === '/api/pms/push') return invoke('pms_push', { config, entries: payload.entries });
+    if (path === '/api/pms/push') return invoke('pms_push', {
+      config,
+      entries: payload.entries.map((entry) => ({ ...entry, manDays: Number(entry.manDays) })),
+    });
     throw new Error('未知的工时系统请求。');
   }
   const response = await fetch(path, {
@@ -169,17 +205,18 @@ function worktreeGroups(change) {
     else uncategorized.push(normalized);
   });
   const sourceKinds = new Set(files.map((file) => file.split('.').pop()?.toLowerCase()));
-  const delivery = sourceKinds.has('java') ? '接口、数据模型、服务与测试' : sourceKinds.has('vue') || sourceKinds.has('ts') ? '页面、表单、接口与测试' : '相关文件';
+  const delivery = sourceKinds.has('java') ? '接口、数据模型与服务' : sourceKinds.has('vue') || sourceKinds.has('ts') ? '页面、表单与接口' : '相关功能';
   const groups = [...topics.entries()].sort((first, second) => second[1] - first[1])
     .map(([scope, count]) => {
       const topic = worktreeTopics.find((item) => item.label === scope);
-      return { scope, actions: [`${topic?.action || `调整${delivery}`}（${count} 个文件，待提交）`] };
+      const action = topic?.action ? `完成${topic.action}` : `完成${delivery}相关开发调整`;
+      return { scope, actions: [action] };
     });
   if (uncategorized.length) {
     const directories = [...new Set(uncategorized.map((file) => file.split('/').slice(0, 2).join('/')).filter(Boolean))].slice(0, 3);
-    groups.push({ scope: '其他改动', actions: [`涉及 ${uncategorized.length} 个文件${directories.length ? `（${directories.join('、')}）` : ''}，待提交`] });
+    groups.push({ scope: '其他功能', actions: [`完成相关功能开发调整${directories.length ? `（${directories.join('、')}）` : ''}`] });
   }
-  return groups.length ? groups : [{ scope: '本地工作区', actions: [`涉及 ${files.length} 个文件，待提交`] }];
+  return groups.length ? groups : [{ scope: '相关功能', actions: ['完成相关功能开发调整'] }];
 }
 
 function escapeHtml(value) {
@@ -189,19 +226,25 @@ function escapeHtml(value) {
 function validAiGroups(groups) {
   if (!Array.isArray(groups)) return [];
   return groups.flatMap((group) => {
-    const scope = String(group?.scope || '').trim();
-    const actions = Array.isArray(group?.actions) ? group.actions.map((action) => String(action).trim()).filter(Boolean) : [];
+    const scope = cleanDeliverableText(group?.scope);
+    const actions = Array.isArray(group?.actions) ? group.actions.map(cleanDeliverableText).filter(Boolean) : [];
     return scope && actions.length ? [{ scope, actions }] : [];
   });
+}
+
+function cleanDeliverableText(value) {
+  return String(value || '').replace(/(?:已提交|待提交|未提交)(?:的|本地)?(?:变更|改动)?/g, '').replace(/Git(?:\s*提交|\s*活动)?/gi, '工作内容').replace(/\s{2,}/g, ' ').trim();
 }
 
 function makeReport(activities, mode, aiContent = null) {
   const commits = activities.reduce((total, activity) => total + activity.commits.filter((commit) => commit.source !== 'working-tree').length, 0);
   const uncommitted = activities.reduce((total, activity) => total + activity.commits.filter((commit) => commit.source === 'working-tree').length, 0);
-  const files = activities.reduce((total, activity) => total + activity.changedFiles, 0);
-  const modules = [...new Set(activities.flatMap((activity) => groupedCommits(activity).map((group) => group.scope)))];
-  const changeSummary = [`${commits} 条 Git 提交`, uncommitted ? `${uncommitted} 项待提交本地变更` : ''].filter(Boolean).join('，');
-  const defaultOverview = `本${mode === 'daily' ? '日' : '周'}识别到 ${changeSummary}，涉及 ${files} 个文件变更。`;
+  const modules = [...new Set(activities.flatMap((activity) => [
+    ...groupedCommits({ ...activity, commits: activity.commits.filter((commit) => commit.source !== 'working-tree') }).map((group) => group.scope),
+    ...activity.commits.filter((commit) => commit.source === 'working-tree').flatMap(worktreeGroups).map((group) => group.scope),
+  ]))];
+  const workItems = activities.reduce((total, activity) => total + activity.commits.length, 0);
+  const defaultOverview = `本${mode === 'daily' ? '日' : '周'}围绕${modules.length ? ` ${modules.slice(0, 6).join('、')} 等` : '相关业务模块'}完成 ${workItems} 项工作。`;
   const defaultFooter = mode === 'daily'
     ? '结合测试与业务验收反馈，确认上述功能的边界场景和后续优化项。'
     : '推进已完成需求的联调、测试与验收，跟进业务反馈并处理遗留问题。';
@@ -211,20 +254,20 @@ function makeReport(activities, mode, aiContent = null) {
     const committed = activity.commits.filter((commit) => commit.source !== 'working-tree');
     const worktree = activity.commits.filter((commit) => commit.source === 'working-tree');
     const committedActivity = { ...activity, commits: committed };
-    const result = [];
-    if (committed.length) result.push({ project: activity.name, label: mode === 'daily' ? '今日完成' : '本周完成', groups: aiSections.get(activity.name)?.length ? aiSections.get(activity.name) : groupedCommits(committedActivity) });
-    if (worktree.length) result.push({ project: activity.name, label: '待提交改动', groups: worktree.flatMap(worktreeGroups) });
-    if (!result.length) result.push({ project: activity.name, label: mode === 'daily' ? '今日完成' : '本周完成', groups: [] });
-    return result;
+    const fallbackGroups = [
+      ...(committed.length ? groupedCommits(committedActivity) : []),
+      ...(worktree.length ? worktree.flatMap(worktreeGroups) : []),
+    ];
+    return [{ project: activity.name, label: mode === 'daily' ? '今日工作' : '本周工作', groups: aiSections.get(activity.name)?.length ? aiSections.get(activity.name) : fallbackGroups }];
   });
-  const overview = String(aiContent?.overview || '').trim() || defaultOverview;
-  const footer = String(aiContent?.footer || '').trim() || defaultFooter;
+  const overview = cleanDeliverableText(aiContent?.overview) || defaultOverview;
+  const footer = cleanDeliverableText(aiContent?.footer) || defaultFooter;
   const html = [
     `<section><h2>工作概览</h2><p>${escapeHtml(overview)}</p></section>`,
-    ...sections.map((section) => `<section><h2>${escapeHtml(section.project)} · ${escapeHtml(section.label)}</h2><ul>${section.groups.length ? section.groups.map((group) => `<li><strong>${escapeHtml(group.scope)}</strong><span>${group.actions.map(escapeHtml).join('；')}。</span></li>`).join('') : '<li>该时间范围内没有新的 Git 提交。</li>'}</ul></section>`),
-    `<section><h2>${mode === 'daily' ? '待跟进' : '下周计划'}</h2><p>${escapeHtml(footer)}</p></section>`,
+    ...sections.map((section) => `<section><h2>${escapeHtml(section.project)} · ${escapeHtml(section.label)}</h2><ul>${section.groups.length ? section.groups.map((group) => `<li><strong>${escapeHtml(group.scope)}</strong><span>${group.actions.map((action) => escapeHtml(cleanDeliverableText(action))).join('；')}。</span></li>`).join('') : '<li>该时间范围内暂无可识别的工作内容。</li>'}</ul></section>`),
+    `<section><h2>${mode === 'daily' ? '后续安排' : '下周计划'}</h2><p>${escapeHtml(footer)}</p></section>`,
   ].join('');
-  return { commits, uncommitted, files, overview, sections, footer, html };
+  return { commits, uncommitted, overview, sections, footer, html };
 }
 
 function defaultWorkContent(section) {
@@ -244,28 +287,69 @@ function makePmsRows(bundle) {
   }));
 }
 
+function pmsMergeKey(projectId, sourceIds) {
+  return `${projectId}:${[...sourceIds].sort().join('|')}`;
+}
+
+function combinedWorkContent(rows) {
+  return rows.map((row) => `${row.sourceProject}：${row.remark}`).join('\n').slice(0, 1000);
+}
+
+function makePmsDisplayRows(rows, mergeValues) {
+  const groups = new Map();
+  rows.forEach((row) => {
+    // A selected row with a PMS project joins other rows for that same project.
+    // Rows without a PMS project stay separate so their mapping can still be chosen independently.
+    const groupKey = row.selected && row.projectId ? `project:${row.projectId}` : `row:${row.clientId}`;
+    const group = groups.get(groupKey) || [];
+    group.push(row);
+    groups.set(groupKey, group);
+  });
+
+  return [...groups.values()].map((sourceRows) => {
+    if (sourceRows.length === 1) return { ...sourceRows[0], sourceIds: [sourceRows[0].clientId], merged: false };
+    const projectId = sourceRows[0].projectId;
+    const sourceIds = sourceRows.map((row) => row.clientId);
+    const mergeKey = pmsMergeKey(projectId, sourceIds);
+    const override = mergeValues[mergeKey] || {};
+    return {
+      clientId: `merged:${mergeKey}`,
+      sourceProject: sourceRows.map((row) => row.sourceProject).join('、'),
+      sourceIds,
+      sourceRows,
+      mergeKey,
+      merged: true,
+      projectId,
+      manDays: override.manDays ?? sourceRows.find((row) => row.manDays)?.manDays ?? '',
+      remark: override.remark ?? combinedWorkContent(sourceRows),
+      selected: true,
+    };
+  });
+}
+
 function IconButton({ label, children, ...props }) {
   return <button className="icon-button" aria-label={label} title={label} {...props}>{children}</button>;
 }
 
 function App() {
-  const [projects, setProjects] = useState([]);
-  const [mode, setMode] = useState('daily');
-  const [date, setDate] = useState(today);
-  const [dailyDates, setDailyDates] = useState([today]);
+  const [workspaceCache] = useState(() => readWorkspaceCache());
+  const [projects, setProjects] = useState(() => workspaceCache.projects || []);
+  const [mode, setMode] = useState(() => workspaceCache.mode || 'daily');
+  const [date, setDate] = useState(() => workspaceCache.date || today);
+  const [dailyDates, setDailyDates] = useState(() => workspaceCache.dailyDates?.length ? workspaceCache.dailyDates : [today]);
   const [calendarOpen, setCalendarOpen] = useState(false);
   const [calendarCursor, setCalendarCursor] = useState(dateFromIso(today));
   const [pendingDates, setPendingDates] = useState([today]);
   const [weekOpen, setWeekOpen] = useState(false);
   const [weekCursor, setWeekCursor] = useState(dateFromIso(today));
   const [pendingWeek, setPendingWeek] = useState(today);
-  const [onlyMine, setOnlyMine] = useState(true);
-  const [aiEnabled, setAiEnabled] = useState(true);
+  const [onlyMine, setOnlyMine] = useState(() => workspaceCache.onlyMine ?? true);
+  const [aiEnabled, setAiEnabled] = useState(() => workspaceCache.aiEnabled ?? true);
   const [aiConfigOpen, setAiConfigOpen] = useState(false);
-  const [aiBaseUrl, setAiBaseUrl] = useState('https://api.openai.com/v1');
+  const [aiBaseUrl, setAiBaseUrl] = useState(() => workspaceCache.aiBaseUrl || 'https://api.openai.com/v1');
   const [aiApiKey, setAiApiKey] = useState('');
-  const [reports, setReports] = useState([]);
-  const [activeReportDate, setActiveReportDate] = useState(today);
+  const [reports, setReports] = useState(() => workspaceCache.reports || []);
+  const [activeReportDate, setActiveReportDate] = useState(() => workspaceCache.reports?.some((bundle) => bundle.date === workspaceCache.activeReportDate) ? workspaceCache.activeReportDate : today);
   const [loading, setLoading] = useState(false);
   const [notice, setNotice] = useState('');
   const [pmsOpen, setPmsOpen] = useState(false);
@@ -273,13 +357,29 @@ function App() {
   const [pmsSubmitting, setPmsSubmitting] = useState(false);
   const [pmsProjects, setPmsProjects] = useState([]);
   const [pmsRows, setPmsRows] = useState([]);
+  const [pmsMergeValues, setPmsMergeValues] = useState({});
   const [pmsResults, setPmsResults] = useState([]);
-  const [pmsConfig, setPmsConfig] = useState({ baseUrl: 'http://192.168.24.48:8081', tenantName: '000000', username: '', password: '' });
+  const [pmsConfig, setPmsConfig] = useState(() => ({ ...defaultPmsConfig, ...workspaceCache.pmsConfig, password: '' }));
   const reportRef = useRef(null);
   const range = useMemo(() => dateRange(date, mode), [date, mode]);
   const activeBundle = reports.find((bundle) => bundle.date === activeReportDate) || null;
   const report = activeBundle?.report || null;
   const activities = activeBundle?.activities || [];
+  const pmsDisplayRows = useMemo(() => makePmsDisplayRows(pmsRows, pmsMergeValues), [pmsRows, pmsMergeValues]);
+
+  useEffect(() => {
+    try {
+      // Passwords and API keys intentionally stay out of browser storage.
+      window.localStorage.setItem(workspaceCacheKey, JSON.stringify({
+        projects, mode, date, dailyDates, onlyMine, aiEnabled, aiBaseUrl,
+        pmsConfig: { baseUrl: pmsConfig.baseUrl, tenantName: pmsConfig.tenantName, username: pmsConfig.username },
+        reports: reports.slice(-10).map((bundle) => ({ date: bundle.date, report: bundle.report })),
+        activeReportDate,
+      }));
+    } catch {
+      // Caching is a convenience. The report workflow remains available if storage is unavailable.
+    }
+  }, [projects, mode, date, dailyDates, onlyMine, aiEnabled, aiBaseUrl, pmsConfig, reports, activeReportDate]);
 
   function flash(message) {
     setNotice(message);
@@ -307,8 +407,16 @@ function App() {
     setCalendarOpen(true);
   }
 
-  function togglePendingDate(value) {
-    setPendingDates((current) => current.includes(value) ? current.filter((item) => item !== value) : [...current, value].sort());
+  function togglePendingDate(value, event) {
+    setPendingDates((current) => {
+      // A normal click changes the report date. Hold Shift when selecting
+      // additional dates so switching from one day to another never leaves
+      // the previous day in the next report generation.
+      if (!event?.shiftKey) return [value];
+      return current.includes(value)
+        ? current.filter((item) => item !== value)
+        : [...current, value].sort();
+    });
   }
 
   function confirmDates() {
@@ -385,12 +493,32 @@ function App() {
   function openPmsPreview() {
     if (!activeBundle || mode !== 'daily') { flash('请先生成一份日报。'); return; }
     setPmsRows(makePmsRows(activeBundle));
+    setPmsMergeValues({});
     setPmsResults([]);
     setPmsOpen(true);
   }
 
   function updatePmsRow(clientId, patch) {
     setPmsRows((rows) => rows.map((row) => row.clientId === clientId ? { ...row, ...patch } : row));
+  }
+
+  function updatePmsDisplayRow(row, patch) {
+    if (!row.merged) { updatePmsRow(row.clientId, patch); return; }
+
+    if (Object.hasOwn(patch, 'selected')) {
+      setPmsRows((rows) => rows.map((source) => row.sourceIds.includes(source.clientId) ? { ...source, selected: patch.selected } : source));
+      return;
+    }
+
+    const nextProjectId = patch.projectId ?? row.projectId;
+    const nextMergeKey = pmsMergeKey(nextProjectId, row.sourceIds);
+    setPmsMergeValues((values) => ({
+      ...values,
+      [nextMergeKey]: { manDays: row.manDays, remark: row.remark, ...values[row.mergeKey], ...patch },
+    }));
+    if (Object.hasOwn(patch, 'projectId')) {
+      setPmsRows((rows) => rows.map((source) => row.sourceIds.includes(source.clientId) ? { ...source, projectId: patch.projectId } : source));
+    }
   }
 
   async function loadPmsProjects() {
@@ -400,12 +528,12 @@ function App() {
       const { projects: availableProjects } = await pmsRequest('/api/pms/projects', { config: pmsConfig });
       setPmsProjects(availableProjects || []);
       flash(`已读取 ${availableProjects?.length || 0} 个可填报项目`);
-    } catch (error) { flash(`无法读取工时项目：${error.message}`); }
+    } catch (error) { flash(`无法读取工时项目：${errorMessage(error, '读取工时项目失败。')}`); }
     finally { setPmsLoading(false); }
   }
 
   async function submitPmsRows() {
-    const rows = pmsRows.filter((row) => row.selected);
+    const rows = pmsDisplayRows.filter((row) => row.selected);
     if (!rows.length) { flash('请至少选择一条工时。'); return; }
     const invalid = rows.some((row) => !row.projectId || !Number(row.manDays) || !row.remark.trim());
     if (invalid) { flash('已选工时需要补全项目、工时和工作内容。'); return; }
@@ -419,14 +547,14 @@ function App() {
       const success = (results || []).filter((item) => item.status === 'submitted').length;
       const skipped = (results || []).filter((item) => item.status === 'skipped').length;
       flash(`推送完成：${success} 条成功${skipped ? `，${skipped} 条未覆盖` : ''}`);
-    } catch (error) { flash(`工时推送失败：${error.message}`); }
+    } catch (error) { flash(`工时推送失败：${errorMessage(error, '请确认工时系统连接和登录信息后重试。')}`); }
     finally { setPmsSubmitting(false); }
   }
 
   return <div className="app-shell">
     <header className="app-header">
       <div className="brand"><span className="brand-mark"><Sparkles size={15} /></span><span>日报引擎</span></div>
-      <div className="header-status"><ShieldCheck size={14} /> 本地处理，数据不上传</div>
+      <div className="header-status"><ShieldCheck size={14} /> 本地处理，自动保存</div>
       <div className="header-actions"><span className="quiet-label">{projects.length} 个项目</span><IconButton label="刷新当前报告" onClick={generate}><RefreshCw size={16} /></IconButton></div>
     </header>
 
@@ -455,7 +583,8 @@ function App() {
             {calendarOpen && <div className="multi-calendar" role="dialog" aria-label="选择多个日报日期">
               <div className="calendar-top"><button aria-label="上个月" onClick={() => setCalendarCursor((current) => new Date(current.getFullYear(), current.getMonth() - 1, 1))}><ChevronLeft size={15} /></button><strong>{calendarCursor.toLocaleDateString('zh-CN', { year: 'numeric', month: 'long' })}</strong><button aria-label="下个月" onClick={() => setCalendarCursor((current) => new Date(current.getFullYear(), current.getMonth() + 1, 1))}><ChevronRight size={15} /></button></div>
               <div className="calendar-weekdays">{['一', '二', '三', '四', '五', '六', '日'].map((day) => <span key={day}>{day}</span>)}</div>
-              <div className="calendar-grid">{calendarDays(calendarCursor).map((item) => <button key={item.iso} disabled={item.iso > today} className={`${item.inMonth ? '' : 'outside'} ${pendingDates.includes(item.iso) ? 'selected' : ''} ${item.iso === today ? 'today' : ''}`} onClick={() => togglePendingDate(item.iso)}>{item.value.getDate()}</button>)}</div>
+              <p className="calendar-tip">点击切换日期，按住 Shift 可多选</p>
+              <div className="calendar-grid">{calendarDays(calendarCursor).map((item) => <button key={item.iso} disabled={item.iso > today} className={`${item.inMonth ? '' : 'outside'} ${pendingDates.includes(item.iso) ? 'selected' : ''} ${item.iso === today ? 'today' : ''}`} onClick={(event) => togglePendingDate(item.iso, event)}>{item.value.getDate()}</button>)}</div>
               <div className="calendar-footer"><span>已选择 {pendingDates.length} 天</span><div><button onClick={() => setCalendarOpen(false)}>取消</button><button className="calendar-confirm" onClick={confirmDates}>确认日期</button></div></div>
             </div>}
           </div> : <div className="date-multi">
@@ -486,12 +615,12 @@ function App() {
 
         <section className="document-sheet">
           <div className="document-toolbar">
-            <div><p className="document-label">{mode === 'daily' ? 'DAILY REPORT' : 'WEEKLY REPORT'}</p><h1>{mode === 'daily' ? '工作日报' : '工作周报'}</h1><p className="document-date">{labelDate(activeBundle?.date || date, mode)}</p></div>
+            <div><p className="document-label">{mode === 'daily' ? 'DAILY DELIVERY REPORT' : 'WEEKLY DELIVERY REPORT'}</p><h1>{mode === 'daily' ? '工作日报' : '工作周报'}</h1><p className="document-date">{labelDate(activeBundle?.date || date, mode)}</p></div>
             <div className="export-actions"><IconButton label="复制报告" onClick={copyReport} disabled={!report}><Clipboard size={16} /></IconButton><button className="secondary-button" onClick={exportReport} disabled={!report}><Download size={15} />导出 Markdown</button>{mode === 'daily' && <button className="pms-open-button" onClick={openPmsPreview} disabled={!report}><Send size={15} />推送工时</button>}</div>
           </div>
           {mode === 'daily' && reports.length > 1 && <div className="report-tabs" role="tablist">{reports.map((bundle) => <button role="tab" aria-selected={activeReportDate === bundle.date} className={activeReportDate === bundle.date ? 'active' : ''} key={bundle.date} onClick={() => setActiveReportDate(bundle.date)}>{labelDate(bundle.date, 'daily')}</button>)}</div>}
           {report ? <article className="report-content" ref={reportRef} contentEditable suppressContentEditableWarning dangerouslySetInnerHTML={{ __html: report.html }} onInput={(event) => setReports((current) => current.map((bundle) => bundle.date === activeReportDate ? { ...bundle, report: { ...bundle.report, html: event.currentTarget.innerHTML } } : bundle))} /> : <div className="report-empty"><span className="report-empty-icon"><FileText size={30} /></span><h2>{projects.length ? '准备一份新的工作报告' : '先添加一个项目'}</h2><p>{projects.length ? '确认日期和提交范围后，生成一份可编辑的日报。' : '日报引擎只读取本机 Git 数据，不会上传你的代码。'}</p><div className="empty-steps"><span><b>1</b> 添加项目</span><span><b>2</b> 选择日期</span><span><b>3</b> 生成报告</span></div><button onClick={projects.length ? generate : addProjects}><Sparkles size={15} />{projects.length ? '生成报告' : '添加项目'}</button></div>}
-          <footer className="document-footer"><span><ShieldCheck size={13} /> 仅基于本地 Git 数据</span>{report && <span>{report.commits} 条提交{report.uncommitted ? ` · ${report.uncommitted} 项未提交变更` : ''} · {report.files} 个文件变更</span>}</footer>
+          <footer className="document-footer"><span><ShieldCheck size={13} /> 仅基于本地工作记录</span>{report && <span>{(report.sections || []).filter((section) => section.groups?.length).length} 个项目</span>}</footer>
         </section>
       </main>
 
@@ -513,10 +642,10 @@ function App() {
           <label><span>密码</span><input type="password" value={pmsConfig.password} onChange={(event) => setPmsConfig((value) => ({ ...value, password: event.target.value }))} autoComplete="current-password" /></label>
           <button className="pms-load-button" onClick={loadPmsProjects} disabled={pmsLoading}>{pmsLoading ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}{pmsProjects.length ? '刷新项目' : '读取项目'}</button>
         </div>
-        <div className="pms-preview-heading"><div><strong>待推送清单</strong><span>日报正文可继续编辑；推送前请在此确认项目、工时与工作内容。</span></div><span>{pmsRows.filter((row) => row.selected).length} 条已选</span></div>
-        <div className="pms-table-wrap"><table className="pms-table"><thead><tr><th>推送</th><th>日报项目</th><th>工时系统项目</th><th>工时（天）</th><th>工作内容</th><th>结果</th></tr></thead><tbody>{pmsRows.map((row) => {
+        <div className="pms-preview-heading"><div><strong>待推送清单</strong><span>选择相同工时项目的日报会自动合并，工时只需填写一次。</span></div><span>{pmsDisplayRows.filter((row) => row.selected).length} 条将推送</span></div>
+        <div className="pms-table-wrap"><table className="pms-table"><thead><tr><th>推送</th><th>日报项目</th><th>工时系统项目</th><th>工时（天）</th><th>工作内容</th><th>结果</th></tr></thead><tbody>{pmsDisplayRows.map((row) => {
           const result = pmsResults.find((item) => item.clientId === row.clientId);
-          return <tr key={row.clientId}><td><input aria-label={`选择 ${row.sourceProject}`} type="checkbox" checked={row.selected} onChange={(event) => updatePmsRow(row.clientId, { selected: event.target.checked })} /></td><td><strong>{row.sourceProject}</strong></td><td><select aria-label={`${row.sourceProject} 对应项目`} value={row.projectId} onChange={(event) => updatePmsRow(row.clientId, { projectId: event.target.value })}><option value="">选择工时项目</option>{pmsProjects.map((project) => <option key={project.id} value={project.id}>{project.name} · {project.code}</option>)}</select></td><td><input aria-label={`${row.sourceProject} 工时`} className="pms-days" type="number" min="0" max="31" step="0.01" value={row.manDays} onChange={(event) => updatePmsRow(row.clientId, { manDays: event.target.value })} placeholder="0.00" /></td><td><textarea aria-label={`${row.sourceProject} 工作内容`} value={row.remark} maxLength="1000" onChange={(event) => updatePmsRow(row.clientId, { remark: event.target.value })} /></td><td>{result && <span className={`pms-result ${result.status}`}>{result.message}</span>}</td></tr>;
+          return <tr key={row.clientId}><td><input aria-label={`选择 ${row.sourceProject}`} type="checkbox" checked={row.selected} onChange={(event) => updatePmsDisplayRow(row, { selected: event.target.checked })} /></td><td><strong>{row.sourceProject}</strong>{row.merged && <span className="pms-merged-label">已合并 {row.sourceIds.length} 个仓库</span>}</td><td><select aria-label={`${row.sourceProject} 对应项目`} value={row.projectId} onChange={(event) => updatePmsDisplayRow(row, { projectId: event.target.value })}><option value="">选择工时项目</option>{pmsProjects.map((project) => <option key={project.id} value={project.id}>{project.name} · {project.code}</option>)}</select></td><td><input aria-label={`${row.sourceProject} 工时`} className="pms-days" type="number" min="0" max="31" step="0.01" value={row.manDays} onChange={(event) => updatePmsDisplayRow(row, { manDays: event.target.value })} placeholder="0.00" /></td><td><textarea aria-label={`${row.sourceProject} 工作内容`} value={row.remark} maxLength="1000" onChange={(event) => updatePmsDisplayRow(row, { remark: event.target.value })} /></td><td>{result && <span className={`pms-result ${result.status}`}>{result.message}</span>}</td></tr>;
         })}</tbody></table></div>
         <footer className="pms-dialog-footer"><span><ShieldCheck size={14} /> 点击推送后才会写入工时系统；已有工时不会被覆盖。</span><div><button className="pms-cancel" onClick={() => setPmsOpen(false)}>稍后处理</button><button className="pms-submit" onClick={submitPmsRows} disabled={pmsSubmitting || !pmsProjects.length}>{pmsSubmitting ? <LoaderCircle className="spin" size={15} /> : <Send size={15} />}{pmsSubmitting ? '正在推送' : '确认并推送'}</button></div></footer>
       </section>

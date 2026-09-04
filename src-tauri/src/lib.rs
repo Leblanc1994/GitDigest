@@ -291,7 +291,7 @@ fn enhance_report_with_ai(activities: Vec<ProjectActivity>, mode: String, base_u
     let body = serde_json::json!({
         "model": model,
         "input": [
-            { "role": "system", "content": "你是严谨的中文工作周报助手。仅依据提供的 Git 变更摘要和文件路径撰写，不要虚构需求、业务结果、测试完成情况、进度、风险或计划。source 为 working-tree 的内容是尚未提交的本地改动，必须明确表述为“已修改/待提交”，不得写成“已完成”或“已上线”。合并语义重复的变更，使用简洁、可汇报的中文。项目没有变更时不要为它生成工作项。footer 表示待跟进或下周计划；如果变更记录没有依据，请写“待根据业务排期和验收反馈确认后续工作。”" },
+            { "role": "system", "content": "你是严谨的中文工作日报助手。仅依据提供的变更摘要和文件路径，按项目和业务模块整理可直接交付的工作内容，重点说明“哪个模块完成了什么事情”。不要输出或提及 Git、提交、已提交、未提交、待提交、工作区、分支、文件数量等过程信息，也不要虚构需求、业务结果、测试完成情况、进度、风险或计划。所有变更记录都按本周期完成的工作来表述，使用“完成、开发、调整、补充、优化”等交付动词；合并语义重复的变更，使用简洁、可汇报的中文。项目没有变更时不要为它生成工作项。footer 表示简短的后续安排；如果变更记录没有依据，请写“待根据业务排期和验收反馈确认后续工作。”" },
             { "role": "user", "content": format!("请整理一份{}。Git 依据如下：\\n{}", if mode == "weekly" { "周报" } else { "日报" }, serde_json::to_string(&ai_source(&activities)).unwrap_or_default()) }
         ],
         "text": { "format": { "type": "json_schema", "name": "git_report", "strict": true, "schema": schema } }
